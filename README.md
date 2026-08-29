@@ -2,9 +2,9 @@
 
 An AI-powered lesson planning assistant that helps teachers create evidence-based lesson plans in seconds.
 
-A demo is continuously deployed on an AWS EC2 instance
+This is the public repo - there are no documents. However, a demo is continuously deployed on an AWS EC2 instance
 
-![ec2-51-24-187-45.eu-west-2.compute.amazonaws.com:8501](ec2-51-24-187-45.eu-west-2.compute.amazonaws.com:8501)
+![http://ec2-51-24-187-45.eu-west-2.compute.amazonaws.com:8501](http://ec2-51-24-187-45.eu-west-2.compute.amazonaws.com:8501)
 
 ![The input](input.png)
 
@@ -156,9 +156,3 @@ The workflow in `.github/workflows/deploy.yml` builds the Docker image on every 
 4. The workflow creates a persistent Docker volume for Qdrant data
 
 The workflow is non-destructive: it stops the old container gracefully, starts the new one with health checks, and rolls back if the app doesn't respond within 30 seconds.
-
-## License & Data
-
-This is a private repository. The curriculum content, exam questions, and lesson templates are confidential and not redistributable without permission from the exam board and publishers.
-
-For questions or to see this app in action, contact the developer.
