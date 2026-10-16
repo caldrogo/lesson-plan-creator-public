@@ -1,0 +1,4 @@
+[server]
+# Transformers uses lazy imports; module inspection by the watcher can load
+# optional vision dependencies. Restart Streamlit after editing application code.
+fileWatcherType = "none"

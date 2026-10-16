@@ -1,0 +1,195 @@
+name: Build, Push, and Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+  APP_NAME: lesson-plan-ai
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  build-push-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ secrets.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        id: image
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          IMAGE_URI="$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker build --pull --tag "$IMAGE_URI" --tag "$REGISTRY/$ECR_REPOSITORY:latest" .
+          echo "size_bytes=$(docker image inspect --format '{{.Size}}' "$IMAGE_URI")" >> "$GITHUB_OUTPUT"
+          docker push "$IMAGE_URI"
+          docker push "$REGISTRY/$ECR_REPOSITORY:latest"
+          echo "uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+          
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1.2.2
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.uri }}
+          IMAGE_SIZE_BYTES: ${{ steps.image.outputs.size_bytes }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          APP_NAME: ${{ env.APP_NAME }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          port: ${{ secrets.EC2_SSH_PORT || 22 }}
+          command_timeout: 30m
+          envs: IMAGE_URI,IMAGE_SIZE_BYTES,AWS_REGION,ECR_REGISTRY,ECR_REPOSITORY,APP_NAME
+          script: |
+            set -euo pipefail
+            trap 'echo "Deployment failed"; docker ps -a; docker logs --tail 100 lesson-plan-qdrant 2>/dev/null || true; docker logs --tail 100 "$APP_NAME" 2>/dev/null || true' ERR
+            command -v docker >/dev/null
+            command -v aws >/dev/null
+            mkdir -p "$HOME/$APP_NAME"
+
+            aws ecr get-login-password --region "$AWS_REGION" \
+              | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+            docker network inspect lesson-plan-network >/dev/null 2>&1 \
+              || docker network create lesson-plan-network
+
+            # Remove only superseded app images with no container references.
+            # Protect stopped containers too; never prune volumes or other repositories.
+            container_images=()
+            while IFS= read -r container_id; do
+              container_images+=("$(docker inspect --format '{{.Image}}' "$container_id")")
+            done < <(docker ps -aq)
+            while read -r image_id image_ref; do
+              [ "$image_ref" != "$IMAGE_URI" ] || continue
+              in_use=0
+              for used_id in "${container_images[@]}"; do
+                if [ "$image_id" = "$used_id" ]; then in_use=1; break; fi
+              done
+              if [ "$in_use" -eq 0 ]; then
+                docker image rm "$image_ref" || true
+              fi
+            done < <(docker image ls --no-trunc \
+              --filter "reference=$ECR_REGISTRY/$ECR_REPOSITORY:*" \
+              --format '{{.ID}} {{.Repository}}:{{.Tag}}')
+
+            docker_root=$(docker info --format '{{.DockerRootDir}}')
+            df -h "$docker_root"
+            df -i "$docker_root"
+            docker system df
+            # Conservative allowance for downloaded layers + unpacking + 1 GiB headroom.
+            # Shared layers may need less. Check before stopping the existing service.
+            if ! docker image inspect "$IMAGE_URI" >/dev/null 2>&1; then
+              required_bytes=$((IMAGE_SIZE_BYTES * 2 + 1073741824))
+              available_kb=$(df -Pk "$docker_root" | awk 'END {print $4}')
+              if [ "$((available_kb * 1024))" -lt "$required_bytes" ]; then
+                echo "Insufficient Docker disk space: need $required_bytes bytes free for pull/unpack."
+                echo "Expand the EBS volume AND its partition/filesystem, then rerun deployment."
+                exit 1
+              fi
+            fi
+            if ! docker pull "$IMAGE_URI"; then
+              echo "Image pull failed; disk bytes and inodes below. Existing services were not stopped."
+              df -h "$docker_root"
+              df -i "$docker_root"
+              docker system df
+              exit 1
+            fi
+
+            docker rm -f lesson-plan-qdrant "$APP_NAME" >/dev/null 2>&1 || true
+            docker run -d \
+              --name lesson-plan-qdrant \
+              --restart unless-stopped \
+              --log-driver local \
+              --log-opt max-size=10m \
+              --log-opt max-file=3 \
+              --network lesson-plan-network \
+              --memory=192m \
+              -e QDRANT__STORAGE__PERFORMANCE__MAX_SEARCH_THREADS=1 \
+              -e QDRANT__STORAGE__OPTIMIZERS__MAX_OPTIMIZATION_THREADS=1 \
+              -e QDRANT__STORAGE__HNSW_INDEX__MAX_INDEXING_THREADS=1 \
+              -p 127.0.0.1:6333:6333 \
+              -p 127.0.0.1:6334:6334 \
+              -v lesson-plan-qdrant-data:/qdrant/storage \
+              qdrant/qdrant:v1.19.1
+
+            qdrant_ready=0
+            for attempt in {1..30}; do
+              if curl --fail --silent http://127.0.0.1:6333/healthz >/dev/null; then
+                qdrant_ready=1
+                break
+              fi
+              sleep 2
+            done
+            test "$qdrant_ready" -eq 1
+
+            env_file_args=()
+            if [ -f "$HOME/$APP_NAME/.env" ]; then
+              env_file_args+=(--env-file "$HOME/$APP_NAME/.env")
+            fi
+            # Ingestion is a deployment job, never part of a teacher request.
+            docker run --rm \
+              --network lesson-plan-network \
+              "${env_file_args[@]}" \
+              --memory=640m \
+              -e LP_EMBEDDING_BATCH_SIZE=8 \
+              -e LP_INGESTION_BATCH_SIZE=8 \
+              -e OMP_NUM_THREADS=1 \
+              -e MKL_NUM_THREADS=1 \
+              -e TOKENIZERS_PARALLELISM=false \
+              -e LP_QDRANT_URL=http://lesson-plan-qdrant:6333 \
+              -v lesson-plan-embedding-cache:/root/.cache/huggingface \
+              "$IMAGE_URI" python -m lesson_plan_ai.v2.cli index
+            docker run -d \
+              -v lesson-plan-embedding-cache:/root/.cache/huggingface \
+              --name "$APP_NAME" \
+              --restart unless-stopped \
+              --log-driver local \
+              --log-opt max-size=10m \
+              --log-opt max-file=3 \
+              --network lesson-plan-network \
+              "${env_file_args[@]}" \
+              --add-host host.docker.internal:host-gateway \
+              --memory=640m \
+              -e LP_EMBEDDING_BATCH_SIZE=8 \
+              -e LP_INGESTION_BATCH_SIZE=8 \
+              -e OMP_NUM_THREADS=1 \
+              -e MKL_NUM_THREADS=1 \
+              -e TOKENIZERS_PARALLELISM=false \
+              -e LP_QDRANT_URL=http://lesson-plan-qdrant:6333 \
+              -p 8501:8501 \
+              "$IMAGE_URI"
+
+            for attempt in {1..30}; do
+              if curl --fail --silent http://127.0.0.1:8501/_stcore/health >/dev/null; then
+                echo "Deployment healthy: $IMAGE_URI"
+                exit 0
+              fi
+              sleep 2
+            done
+            docker logs --tail 100 "$APP_NAME"
+            exit 1
